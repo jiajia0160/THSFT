@@ -309,15 +309,17 @@ class RobotTrajectoryDataset(Dataset):
         instruction = item['instruction']
         output = item['output']
         
-        # Tokenize instruction and output
-        # We want to train on output, conditioned on instruction
-        # Format: [BOS] instruction [EOS] output [EOS] ? Or just concatenation
-        # Qwen usually uses ChatML or similar, but here we do simple concatenation
+        # 1. 修正输入构造与Mask逻辑（使用 Chat Template）
+        messages = [
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": output}
+        ]
         
-        full_text = f"{instruction}\n{output}"
+        # 使用 Qwen 的模板处理，且不添加生成时的特殊token
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         
         encodings = self.tokenizer(
-            full_text,
+            text,
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
@@ -330,22 +332,18 @@ class RobotTrajectoryDataset(Dataset):
         # Create labels: mask out instruction part
         labels = input_ids.clone()
         
-        # Find where instruction ends. This is approximate if truncation happens.
-        # Better way: tokenize instruction separately to find its length
-        instr_enc = self.tokenizer(
-            f"{instruction}\n",
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors='pt'
-        )
-        instr_len = instr_enc['input_ids'].shape[1]
+        # Label Masking 需要根据模板后的 token id 找到 assistant 开始的位置进行 mask
+        # Construct user part to find its length
+        user_messages = [{"role": "user", "content": instruction}]
+        user_text = self.tokenizer.apply_chat_template(user_messages, tokenize=False, add_generation_prompt=True)
+        user_enc = self.tokenizer(user_text, return_tensors='pt')
+        instr_len = user_enc['input_ids'].shape[1]
         
         if instr_len < self.max_length:
             labels[:instr_len] = -100
         else:
             # If instruction is too long, we might mask everything or handle it differently
-            # Here we assume instruction fits
-            pass
+            labels[:] = -100
             
         labels[attention_mask == 0] = -100 # Mask padding
         
@@ -374,8 +372,7 @@ class RobotTrajectoryDataset(Dataset):
             'attention_mask': attention_mask,
             'labels': labels,
             'pwl': pwl_tensor,
-            'stl_json': stl_json,
-            'instr_len': instr_len
+            'stl_json': stl_json
         }
 
 def collate_fn(batch):
@@ -384,15 +381,13 @@ def collate_fn(batch):
     labels = torch.stack([item['labels'] for item in batch])
     pwl = torch.stack([item['pwl'] for item in batch])
     stl_jsons = [item['stl_json'] for item in batch]
-    instr_lens = torch.tensor([item['instr_len'] for item in batch], dtype=torch.long)
     
     return {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'labels': labels,
         'pwl': pwl,
-        'stl_jsons': stl_jsons,
-        'instr_lens': instr_lens
+        'stl_jsons': stl_jsons
     }
 
 # -----------------------------------------------------------------------------
@@ -430,7 +425,7 @@ class MultimodalRobotModel(nn.Module):
         # Cast regression head to bfloat16 to match model
         self.regression_head.to(torch.bfloat16)
         
-    def forward(self, input_ids, attention_mask, instr_lens=None, labels=None):
+    def forward(self, input_ids, attention_mask, labels=None, **kwargs):
         # Get LLM outputs
         outputs = self.llm(
             input_ids=input_ids,
@@ -443,12 +438,16 @@ class MultimodalRobotModel(nn.Module):
         logits = outputs.logits
         
         # Regression
-        # We need to pick a token to represent the instruction for regression.
-        # We use the last token of the instruction.
+        # 3. 提取用于回归的特征 (修正逻辑)
+        # 我们希望用“说完所有话”之后的状态来回归轨迹
+        # 方法：找到 attention_mask 中最后一个非 padding 的 token
         batch_size = input_ids.shape[0]
+        sequence_lengths = attention_mask.sum(dim=1) - 1 # [B], 最后一个有效token的索引
+        
         reg_input = []
         for i in range(batch_size):
-            idx = min(instr_lens[i] - 1, hidden_states.shape[1] - 1)
+            # 取该样本最后一个有效 token 的向量
+            idx = sequence_lengths[i]
             reg_input.append(hidden_states[i, idx])
         reg_input = torch.stack(reg_input) # [B, H]
         
@@ -464,6 +463,8 @@ class MultimodalRobotModel(nn.Module):
         
         # Return loss_ce instead of logits to save memory during gather
         return loss_ce, traj_pred
+    
+    
 
 # -----------------------------------------------------------------------------
 # 4. Training Loop
@@ -569,13 +570,12 @@ def train():
             labels = batch['labels'].to(device)
             pwl_target = batch['pwl'].to(device)
             stl_jsons = batch['stl_jsons']
-            instr_lens = batch['instr_lens'].to(device)
             
             optimizer.zero_grad()
             
             # Forward
             # Pass labels to compute CE loss inside model (distributed)
-            loss_ce_list, traj_pred = model(input_ids, attention_mask, instr_lens, labels)
+            loss_ce_list, traj_pred = model(input_ids, attention_mask, labels=labels)
             
             # 1. CE Loss
             # loss_ce_list is a tensor of shape [num_gpus] (if DataParallel) or scalar
@@ -652,7 +652,7 @@ def train():
         print(f"Epoch {epoch} Average Loss: {total_loss / len(dataloader)}")
 
     # Save model
-    torch.save(model.state_dict(), "robot_model_finetuned.pth")
+    torch.save(model.state_dict(), "robot_model_finetuned_1209.pth")
     print("Training complete.")
 
 if __name__ == "__main__":
