@@ -40,13 +40,13 @@ Constraint Types & Schema
   - type: "sequence"
   - tasks: List of task objects, where each task has:
     - target: Room name.
-    - time_bound: Time limit or time interval for this step (number or list, optional).
+    - time_bound: From the perspective of total time allocation, the time limit or time interval of this step (number or list, optional).
     - actions: List of actions (e.g., [{"wait": 5}], optional).
 2. choice: Choose one branch from multiple options.
   - type: "choice"
   - options: List of option objects, where each option has:
     - room: Target room name.
-    - time_bound: Time limit or time interval for this step (number or list, optional).
+    - time_bound: From the perspective of total time allocation, the time limit or time interval of this step (number or list, optional).
     - actions: List of actions.
 3. always_avoid / always_satisfy: Global invariants.
   - type: "always_avoid" or "always_satisfy"
@@ -115,7 +115,7 @@ import time
 '''
 client = OpenAI(
     # This is the default and can be omitted
-    api_key="sk-MZT6pRkO220urRvuW4IdSkA3zfXkOAKelUUXqSJgmRUJSIZU",
+    api_key="sk-3NmuEDi5tVSEceKxArNv1aD7keyDPlQRMiqarJS5rOsd8P8b",
     base_url = "https://api.chatanywhere.tech/v1"
 )
 
@@ -128,7 +128,7 @@ Response:
     start_time = time.time()
 
     completion = client.chat.completions.create(
-    model="deepseek-v3-2-exp", 
+    model="deepseek-v3.2-thinking", 
     messages=[
         {"role": "user", "content": PROMPT+prompt_nl}
     ],
@@ -179,25 +179,26 @@ if __name__ == "__main__":
 
     # 依次处理每个dict单元
     results = []
-    batch_size = 100  # 每100条保存一次
+    batch_size = 5  # 每5条保存一次
     for idx, item in enumerate(data):
-        instruction = item['instruction']
-        print(f"处理第 {idx+1} 条指令: {instruction}")
-        stl_json, used_time = call_llm(instruction)
-        print(f"生成的STL JSON: {stl_json}")
-        
-        results.append({
-            'instruction': instruction,
-            'stl_json': stl_json,
-            'used_time': used_time
-        })
-        
-        # 每处理batch_size条或最后一条时保存
-        if (idx + 1) % batch_size == 0 or idx == len(data) - 1:
-            output_file = '/home/lijia/code/1113_CLHS/train_dataset/1208_dataset_v2/negative_robustness_stljson.json'
-            with open(output_file, 'w', encoding='utf-8') as f_out:
-                json.dump(results, f_out, ensure_ascii=False, indent=2)
-            print(f"已保存前 {len(results)} 条结果到: {output_file}")
+        if idx > 444:
+            instruction = item['instruction']
+            print(f"处理第 {idx+1} 条指令: {instruction}")
+            stl_json, used_time = call_llm(instruction)
+            print(f"生成的STL JSON: {stl_json}")
+            
+            results.append({
+                'instruction': instruction,
+                'stl_json': stl_json,
+                'used_time': used_time
+            })
+            
+            # 每处理batch_size条或最后一条时保存
+            if (idx + 1) % batch_size == 0 or idx == len(data) - 1:
+                output_file = '/home/lijia/code/1113_CLHS/train_dataset/1208_dataset_v2/negative_robustness_stljson_6.json'
+                with open(output_file, 'w', encoding='utf-8') as f_out:
+                    json.dump(results, f_out, ensure_ascii=False, indent=2)
+                print(f"已保存前 {len(results)} 条结果到: {output_file}")
     
     print(f"处理完成，共 {len(results)} 条结果。")
 
