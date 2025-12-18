@@ -1030,6 +1030,37 @@ def train_two_stage(
     stl_converter = DifferentiableSTLConverter(ROOMS)
     #scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     scaler = torch.cuda.amp.GradScaler(enabled=False)
+    
+    # --- Log Experiment Config ---
+    config_log_path = os.path.join(output_dir, 'experiment_log.txt')
+    with open(config_log_path, 'w') as f:
+        f.write("=== Experiment Configuration ===\n")
+        f.write(f"Model Path: {model_path}\n")
+        f.write(f"Data Path: {data_path}\n")
+        f.write(f"Output Dir: {output_dir}\n")
+        f.write(f"Stage 1 Epochs: {stage1_epochs}\n")
+        f.write(f"Stage 2 Epochs: {stage2_epochs}\n")
+        f.write(f"Batch Size: {batch_size}\n")
+        f.write(f"Max Length: {max_length}\n")
+        f.write(f"Max Traj Len: {max_traj_len}\n")
+        f.write(f"LR Stage 1: {lr_stage1}\n")
+        f.write(f"LR Stage 2: {lr_stage2}\n")
+        f.write(f"Lambda STL: {lambda_stl}\n")
+        f.write(f"Lambda CE: {lambda_ce}\n")
+        f.write(f"Weight Decay: {weight_decay}\n")
+        f.write(f"Warmup Ratio: {warmup_ratio}\n")
+        f.write(f"Max Grad Norm: {max_grad_norm}\n")
+        f.write(f"Seed: {seed}\n")
+        f.write(f"Use LoRA: {use_lora}\n")
+        if use_lora:
+            f.write(f"LoRA R: {lora_r}\n")
+            f.write(f"LoRA Alpha: {lora_alpha}\n")
+            f.write(f"LoRA Dropout: {lora_dropout}\n")
+            f.write(f"LoRA Target Modules: {lora_target_modules}\n")
+        f.write(f"Gradient Checkpointing: {gradient_checkpointing}\n")
+        f.write(f"Device: {device}\n")
+        f.write("================================\n\n")
+
     # -------------------------
     # Stage 1: pretrain decoder
     # -------------------------
@@ -1043,8 +1074,13 @@ def train_two_stage(
         decoder_params = list(model.trajectory_decoder.parameters())
         opt1 = torch.optim.AdamW(decoder_params, lr=lr_stage1, weight_decay=weight_decay)
 
+        with open(config_log_path, 'a') as f:
+            f.write("=== Stage 1 Training ===\n")
+
         for epoch in range(1, stage1_epochs + 1):
-            pretrain_decoder_epoch(model, dataloader, opt1, device, epoch)
+            avg_mse = pretrain_decoder_epoch(model, dataloader, opt1, device, epoch)
+            with open(config_log_path, 'a') as f:
+                f.write(f"Epoch {epoch}: MSE={avg_mse:.4f}\n")
 
         ckpt_path = os.path.join(output_dir, 'stage1_decoder.pt')
         torch.save({'trajectory_decoder': model.trajectory_decoder.state_dict()}, ckpt_path)
@@ -1058,6 +1094,9 @@ def train_two_stage(
     # -------------------------
     if stage2_epochs > 0:
         from transformers import get_linear_schedule_with_warmup
+        
+        with open(config_log_path, 'a') as f:
+            f.write("\n=== Stage 2 Training ===\n")
 
         # Configure trainable params: LoRA-only if enabled, otherwise full LLM
         for param in model.trajectory_decoder.parameters():
@@ -1094,6 +1133,9 @@ def train_two_stage(
                 max_grad_norm=max_grad_norm
             )
             print(f"Stage 2 Epoch {epoch} - loss={metrics['loss']:.4f}, ce={metrics['loss_ce']:.4f}, stl={metrics['loss_stl']:.4f}")
+            
+            with open(config_log_path, 'a') as f:
+                f.write(f"Epoch {epoch}: Loss={metrics['loss']:.4f}, CE={metrics['loss_ce']:.4f}, STL={metrics['loss_stl']:.4f}\n")
 
             ckpt = {
                 'llm': model.llm.state_dict(),
@@ -1110,6 +1152,7 @@ def train_two_stage(
                 best_path = os.path.join(output_dir, 'stage2_best.pt')
                 torch.save(ckpt, best_path)
                 print(f"Saved best checkpoint to: {best_path}")
+
 
 
 def _build_argparser():
