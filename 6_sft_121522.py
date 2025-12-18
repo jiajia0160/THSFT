@@ -642,6 +642,13 @@ class MultimodalRobotModel(nn.Module):
         if gradient_checkpointing:
             self.llm.gradient_checkpointing_enable()
             self.llm.config.use_cache = False  # 训练时必须关闭cache，否则显存会爆炸
+            # 必须开启 input_require_grads 才能让梯度流过冻结的层（对于LoRA + Checkpointing很重要）
+            if hasattr(self.llm, "enable_input_require_grads"):
+                self.llm.enable_input_require_grads()
+            else:
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+                self.llm.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
         if self.use_lora:
             target_modules = lora_target_modules or [
@@ -797,8 +804,8 @@ def compute_stl_loss(traj_pred: torch.Tensor, stl_jsons: List[Dict],
             kp[:, :, 2], _ = torch.sort(kp[:, :, 2], dim=1)
             
             t_max = max(kp[0, :, 2].max().item(), 1.0)
-            # 降低采样点数以节省显存 (100 -> 50)
-            t_query = torch.linspace(0, t_max, 80, device=device)
+            # 降低采样点数以节省显存 (80 -> 40)
+            t_query = torch.linspace(0, t_max, 40, device=device)
             
             states = differentiable_interpolate(kp, t_query).squeeze(0)
             robustness = formula.robustness(states, 0)
@@ -943,9 +950,9 @@ def train_two_stage(
     stage1_epochs: int = 300,
     stage2_epochs: int = 10,
     batch_size: int = 1,
-    max_length: int = 1800,
+    max_length: int = 1500,
     max_traj_len: int = 30,
-    lr_stage1: float = 1e-3,
+    lr_stage1: float = 1e-4,
     lr_stage2: float = 1e-5,
     lambda_stl: float = 0.1,
     lambda_ce: float = 1.0,
@@ -1073,18 +1080,42 @@ def train_two_stage(
     if stage1_epochs > 0:
         decoder_params = list(model.trajectory_decoder.parameters())
         opt1 = torch.optim.AdamW(decoder_params, lr=lr_stage1, weight_decay=weight_decay)
+        
+        # 新增：Stage 1 的学习率调度器 (Cosine Annealing)
+        # 让学习率随时间平滑下降，有助于跳出局部最优并最终收敛
+        scheduler1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=stage1_epochs, eta_min=1e-6)
 
         with open(config_log_path, 'a') as f:
             f.write("=== Stage 1 Training ===\n")
 
+        best_mse = float('inf')
+        
         for epoch in range(1, stage1_epochs + 1):
             avg_mse = pretrain_decoder_epoch(model, dataloader, opt1, device, epoch)
+            
+            # 更新学习率
+            scheduler1.step()
+            current_lr = scheduler1.get_last_lr()[0]
+            
             with open(config_log_path, 'a') as f:
-                f.write(f"Epoch {epoch}: MSE={avg_mse:.4f}\n")
+                f.write(f"Epoch {epoch}: MSE={avg_mse:.4f}, LR={current_lr:.2e}\n")
+            
+            # 保存最佳模型
+            if avg_mse < best_mse:
+                best_mse = avg_mse
+                best_ckpt_path = os.path.join(output_dir, 'stage1_decoder_best.pt')
+                torch.save({'trajectory_decoder': model.trajectory_decoder.state_dict()}, best_ckpt_path)
+                print(f"Saved best stage1 decoder (MSE={best_mse:.4f}) to: {best_ckpt_path}")
 
-        ckpt_path = os.path.join(output_dir, 'stage1_decoder.pt')
+        # 最后保存一次最终模型
+        ckpt_path = os.path.join(output_dir, 'stage1_decoder_last.pt')
         torch.save({'trajectory_decoder': model.trajectory_decoder.state_dict()}, ckpt_path)
-        print(f"Saved stage1 decoder to: {ckpt_path}")
+        print(f"Saved last stage1 decoder to: {ckpt_path}")
+        
+        # 训练结束后，加载最好的模型用于Stage 2
+        print(f"Loading best stage1 decoder from {best_ckpt_path} for Stage 2...")
+        best_ckpt = torch.load(best_ckpt_path)
+        model.trajectory_decoder.load_state_dict(best_ckpt['trajectory_decoder'])
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -1093,6 +1124,10 @@ def train_two_stage(
     # Stage 2: finetune LLM
     # -------------------------
     if stage2_epochs > 0:
+        # 再次强制清理显存，确保Stage 1的中间变量全部释放
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         from transformers import get_linear_schedule_with_warmup
         
         with open(config_log_path, 'a') as f:
@@ -1161,14 +1196,14 @@ def _build_argparser():
     p = argparse.ArgumentParser(description='Two-stage self-training for robot trajectory with STL.')
     p.add_argument('--model_path', type=str, default='/home/lijia/code/LLaMA-Factory/models/Qwen/Qwen3-1.7B')
     p.add_argument('--data_path', type=str, default='/home/lijia/code/1113_CLHS/1209_git/THSFT/positive_robustness.json')
-    p.add_argument('--output_dir', type=str, default='/home/lijia/code/1208_CLHS/outputs_6_sft_121724')
+    p.add_argument('--output_dir', type=str, default='/home/lijia/code/1208_CLHS/outputs_6_sft_121815')
 
     p.add_argument('--stage1_epochs', type=int, default=300)
     p.add_argument('--stage2_epochs', type=int, default=10)
     p.add_argument('--batch_size', type=int, default=1)
-    p.add_argument('--max_length', type=int, default=1800)  # 约束的是 指令 + 真值输出 + chat模板 的整体 token 数。512token可能不够
+    p.add_argument('--max_length', type=int, default=1500)  # 约束的是 指令 + 真值输出 + chat模板 的整体 token 数。512token可能不够
     p.add_argument('--max_traj_len', type=int, default=30)
-    p.add_argument('--lr_stage1', type=float, default=1e-3)
+    p.add_argument('--lr_stage1', type=float, default=1e-4)
     p.add_argument('--lr_stage2', type=float, default=1e-5)
     p.add_argument('--lambda_stl', type=float, default=0.1)
     p.add_argument('--lambda_ce', type=float, default=1.0)
