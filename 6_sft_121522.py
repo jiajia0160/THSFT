@@ -284,8 +284,8 @@ The output trajectory is represented in format:
 Here, [x, y, t] indicates that the robot is at the position [x, y] at time t.
 
 Output format:
-<reasoning>Your step-by-step reasoning</reasoning>
 <result>[[x1,y1,t1],[x2,y2,t2],...]</result>
+<reasoning>Your step-by-step reasoning</reasoning>
 
 Input:
 The initial position of the robot is [1,3].
@@ -385,17 +385,79 @@ class RobotTrajectoryDataset(Dataset):
         if result_content is None:
             result_content = str(pwl)
         
+        # --- Smart Truncation Logic ---
+        # 1. Construct full text to check length
         messages = [
             {"role": "user", "content": instruction},
             {"role": "assistant", "content": output_raw}
         ]
-        
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False
         )
+        full_tokens = self.tokenizer.encode(text, add_special_tokens=False)
         
+        if len(full_tokens) > self.max_length:
+            # Need truncation. Strategy: Keep instruction and result, truncate reasoning middle.
+            
+            # Extract parts
+            reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', output_raw, re.DOTALL)
+            if reasoning_match:
+                reasoning_content = reasoning_match.group(1)
+                
+                # Construct a "skeleton" without the reasoning body to see how much space we have
+                # Skeleton: Instruction + <reasoning>...truncated...</reasoning> + <result>...</result>
+                # We use a placeholder for reasoning to calculate overhead
+                placeholder = " ... truncated ... "
+                skeleton_output = output_raw.replace(reasoning_content, placeholder)
+                
+                skeleton_messages = [
+                    {"role": "user", "content": instruction},
+                    {"role": "assistant", "content": skeleton_output}
+                ]
+                skeleton_text = self.tokenizer.apply_chat_template(
+                    skeleton_messages,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                skeleton_tokens = self.tokenizer.encode(skeleton_text, add_special_tokens=False)
+                
+                available_tokens = self.max_length - len(skeleton_tokens)
+                
+                if available_tokens > 0:
+                    # We have space for some reasoning. 
+                    # Let's keep start and end of reasoning.
+                    # Approximate char/token ratio (conservative estimate, e.g. 3 chars per token)
+                    # Better: encode reasoning and slice tokens
+                    reasoning_tokens = self.tokenizer.encode(reasoning_content, add_special_tokens=False)
+                    
+                    if len(reasoning_tokens) > available_tokens:
+                        # Keep start and end
+                        keep_len = available_tokens // 2
+                        start_tokens = reasoning_tokens[:keep_len]
+                        end_tokens = reasoning_tokens[-keep_len:]
+                        
+                        new_reasoning = self.tokenizer.decode(start_tokens) + " ... [truncated] ... " + self.tokenizer.decode(end_tokens)
+                        output_raw = output_raw.replace(reasoning_content, new_reasoning)
+                    # else: reasoning fits, weird that full_tokens > max_length, maybe overhead calculation was off?
+                    # In that case, standard truncation will handle it, but we tried our best.
+                else:
+                    # No space for reasoning at all, just keep placeholder
+                    output_raw = skeleton_output
+            
+            # Re-construct messages with potentially truncated output
+            messages = [
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": output_raw}
+            ]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+
+        # Standard encoding (now likely within limits or close to it)
         encodings = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -736,7 +798,7 @@ def compute_stl_loss(traj_pred: torch.Tensor, stl_jsons: List[Dict],
             
             t_max = max(kp[0, :, 2].max().item(), 1.0)
             # 降低采样点数以节省显存 (100 -> 50)
-            t_query = torch.linspace(0, t_max, 50, device=device)
+            t_query = torch.linspace(0, t_max, 80, device=device)
             
             states = differentiable_interpolate(kp, t_query).squeeze(0)
             robustness = formula.robustness(states, 0)
@@ -878,10 +940,10 @@ def train_two_stage(
     model_path: str,
     data_path: str,
     output_dir: str,
-    stage1_epochs: int = 50,
-    stage2_epochs: int = 8,
+    stage1_epochs: int = 300,
+    stage2_epochs: int = 10,
     batch_size: int = 1,
-    max_length: int = 800,
+    max_length: int = 1800,
     max_traj_len: int = 30,
     lr_stage1: float = 1e-3,
     lr_stage2: float = 1e-5,
@@ -1055,13 +1117,13 @@ def _build_argparser():
 
     p = argparse.ArgumentParser(description='Two-stage self-training for robot trajectory with STL.')
     p.add_argument('--model_path', type=str, default='/home/lijia/code/LLaMA-Factory/models/Qwen/Qwen3-1.7B')
-    p.add_argument('--data_path', type=str, default='/home/lijia/code/1208_CLHS/positive_robustness.json')
-    p.add_argument('--output_dir', type=str, default='/home/lijia/code/1208_CLHS/outputs_6_sft_121211')
+    p.add_argument('--data_path', type=str, default='/home/lijia/code/1113_CLHS/1209_git/THSFT/positive_robustness.json')
+    p.add_argument('--output_dir', type=str, default='/home/lijia/code/1208_CLHS/outputs_6_sft_121724')
 
-    p.add_argument('--stage1_epochs', type=int, default=50)
-    p.add_argument('--stage2_epochs', type=int, default=8)
+    p.add_argument('--stage1_epochs', type=int, default=300)
+    p.add_argument('--stage2_epochs', type=int, default=10)
     p.add_argument('--batch_size', type=int, default=1)
-    p.add_argument('--max_length', type=int, default=800)  # 512token可能不够
+    p.add_argument('--max_length', type=int, default=1800)  # 约束的是 指令 + 真值输出 + chat模板 的整体 token 数。512token可能不够
     p.add_argument('--max_traj_len', type=int, default=30)
     p.add_argument('--lr_stage1', type=float, default=1e-3)
     p.add_argument('--lr_stage2', type=float, default=1e-5)
